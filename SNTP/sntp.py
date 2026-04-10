@@ -4,21 +4,31 @@ import socket
 import struct
 import sys
 import time
-
+import os
 
 NTP_EPOCH = 2208988800
 PACKET_SIZE = 48
-
 
 def system_to_ntp_timestamp(value):
     seconds = int(value) + NTP_EPOCH
     fraction = int((value - int(value)) * (1 << 32)) & 0xFFFFFFFF
     return (seconds << 32) | fraction
 
-
 def ntp_timestamp_to_bytes(value):
     return struct.pack("!Q", value & 0xFFFFFFFFFFFFFFFF)
 
+def get_real_ntp_time():
+    ntp_server = "pool.ntp.org"
+    client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    data = b'\x1b' + 47 * b'\0'
+    try:
+        client.settimeout(2.0)
+        client.sendto(data, (ntp_server, 123))
+        data, address = client.recvfrom(1024)
+        unpacked = struct.unpack("!12I", data)[10]
+        return unpacked - NTP_EPOCH
+    except Exception:
+        return time.time()
 
 def build_response(request, receive_time, transmit_time):
     version = (request[0] >> 3) & 0b111
@@ -49,15 +59,14 @@ def build_response(request, receive_time, transmit_time):
         ]
     )
 
-
 def handle_request(server_socket, data, address, delay):
     if len(data) < PACKET_SIZE:
         return
-    print(address[0], flush=True)
-    receive_time = time.time() + delay
-    response = build_response(data[:PACKET_SIZE], receive_time, time.time() + delay)
+    print(f"Request from: {address[0]}", flush=True)
+    real_base_time = get_real_ntp_time()
+    receive_time = real_base_time + delay
+    response = build_response(data[:PACKET_SIZE], receive_time, real_base_time + delay)
     server_socket.sendto(response, address)
-
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -65,34 +74,25 @@ def parse_args():
     parser.add_argument("-p", "--port", type=int, default=123)
     return parser.parse_args()
 
-
 def main():
     args = parse_args()
-    workers = max(4, (os_cpu_count() or 1) * 4)
+    workers = max(4, (os.cpu_count() or 1) * 4)
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as server_socket:
-        server_socket.bind(("", args.port))
-        print(f"SNTP server started on port {args.port} with delay {args.delay}", flush=True)
+        try:
+            server_socket.bind(("", args.port))
+        except PermissionError:
+            print(f"Error: Port {args.port} requires root privileges.")
+            return
+        
+        print(f"SNTP Proxy Server started on port {args.port} with delay {args.delay}")
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
             while True:
                 try:
                     data, address = server_socket.recvfrom(1024)
+                    executor.submit(handle_request, server_socket, data, address, args.delay)
                 except KeyboardInterrupt:
-                    print("SNTP server stopped", flush=True)
-                    return
-                executor.submit(handle_request, server_socket, data, address, args.delay)
-
-
-def os_cpu_count():
-    try:
-        import os
-
-        return os.cpu_count()
-    except Exception:
-        return 1
-
+                    print("\nServer stopped.")
+                    break
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        sys.exit(0)
+    main()
